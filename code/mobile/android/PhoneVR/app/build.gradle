@@ -16,7 +16,7 @@ def defaultALVRFlavour = "--release"
 android {
     signingConfigs {
         releaseconfig {
-            if( System.getenv('GITHUB_EVENT_NAME') == 'pull_request' || System.getenv("Store") == null || System.getenv("Key") == null ) {
+            if( System.getenv('GITHUB_EVENT_NAME') == 'pull_request' || !System.getenv("Store") || !System.getenv("Key") ) {
                 // If its a PR Supply a dummy KeySigningConfig
                 // Or in Local env if Store and Keys are not present in ENV Vars do the same
                 storeFile file("PhoneVRKeyStorePR.jks")
