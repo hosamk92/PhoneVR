@@ -2,7 +2,6 @@
 #include "cardboard.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2ext.h>
 #include <GLES3/gl3.h>
 #include <algorithm>
 #include <android/hardware_buffer.h>
@@ -15,6 +14,9 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
+// Needs the GL types from gl3.h
+#include <GLES2/gl2ext.h>
 
 #include "nlohmann/json.hpp"
 #include "utils.h"
