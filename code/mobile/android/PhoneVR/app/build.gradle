@@ -39,7 +39,7 @@ android {
     ndkVersion '25.2.9519653' // r25c
     defaultConfig {
         applicationId "viritualisres.phonevr"
-        minSdkVersion 24
+        minSdkVersion 26
         targetSdkVersion 33
         versionCode buildVersionCode()
         versionName buildVersionName()
@@ -51,6 +51,10 @@ android {
             cmake {
                 cppFlags "-std=c++17 -fexceptions -frtti" //-DANDROID_USE_LEGACY_TOOLCHAIN_FILE=ON"
             }
+        }
+        ndk {
+            // ALVR >= 20.9 builds the client core lib for arm64-v8a only (cardboard sdk is arm64 too)
+            abiFilters "arm64-v8a"
         }
 
         defaultPublishConfig 'release'

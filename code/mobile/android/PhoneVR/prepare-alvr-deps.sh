@@ -19,7 +19,7 @@ rustup target add \
 # # mv ALVR-phonevr ALVR
 
 pushd ALVR
-cargo update
+# Keep ALVR's own Cargo.lock (cargo update pulls untested crate versions)
 cargo xtask prepare-deps --platform android $@
 popd
 

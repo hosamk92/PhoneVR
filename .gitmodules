@@ -1,6 +1,6 @@
 [submodule "code/mobile/android/PhoneVR/ALVR"]
 	path = code/mobile/android/PhoneVR/ALVR
-	url = https://github.com/PhoneVR-Developers/ALVR-phonevr
+	url = https://github.com/alvr-org/ALVR
 [submodule "code/windows/libs/json"]
 	path = code/common/libs/json
 	url = https://github.com/nlohmann/json
