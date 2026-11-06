@@ -1,7 +1,11 @@
 #include "alvr_client_core.h"
 #include "cardboard.h"
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2ext.h>
 #include <GLES3/gl3.h>
 #include <algorithm>
+#include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <cmath>
 #include <deque>
@@ -29,6 +33,24 @@ const uint64_t VELOCITY_SAMPLE_INTERVAL_NS = 5e6;
 // Rotate the decoded frame by the head movement that happened since it was rendered on the PC.
 const bool ENABLE_REPROJECTION = true;
 
+// ALVR >= 20.9 renders with wgpu in its own (non shared) EGL context, created by
+// alvr_initialize_opengl(). Eye textures are backed by AHardwareBuffers and imported in both the
+// app (GLSurfaceView) context and the ALVR context.
+struct EglState {
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLSurface draw = EGL_NO_SURFACE;
+    EGLSurface read = EGL_NO_SURFACE;
+    EGLContext context = EGL_NO_CONTEXT;
+};
+
+struct SharedTexture {
+    AHardwareBuffer *buffer = nullptr;
+    EGLImageKHR appImage = EGL_NO_IMAGE_KHR;
+    EGLImageKHR alvrImage = EGL_NO_IMAGE_KHR;
+    GLuint appTexture = 0;    // sampled by the Cardboard distortion renderer
+    GLuint alvrTexture = 0;   // rendered to by ALVR
+};
+
 struct NativeContext {
     JavaVM *javaVm = nullptr;
     jobject javaContext = nullptr;
@@ -55,9 +77,16 @@ struct NativeContext {
     std::vector<std::string> mediacodecStrings;
     std::vector<AlvrMediacodecOption> mediacodecOptions;
 
+    EglState appEgl;
+    EglState alvrEgl;
+    PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC eglGetNativeClientBufferANDROID = nullptr;
+    PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR = nullptr;
+    PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR = nullptr;
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = nullptr;
+
     // Une one texture per eye, no need for swapchains.
-    GLuint lobbyTextures[2] = {0, 0};
-    GLuint streamTextures[2] = {0, 0};
+    SharedTexture lobbyTextures[2] = {};
+    SharedTexture streamTextures[2] = {};
 
     float eyeOffsets[2] = {0.0, 0.0};
     AlvrFov fovArr[2] = {};
@@ -77,6 +106,96 @@ int64_t GetBootTimeNano() {
     struct timespec res = {};
     clock_gettime(CLOCK_BOOTTIME, &res);
     return (res.tv_sec * 1e9) + res.tv_nsec;
+}
+
+EglState currentEgl() {
+    EglState state;
+    state.display = eglGetCurrentDisplay();
+    state.draw = eglGetCurrentSurface(EGL_DRAW);
+    state.read = eglGetCurrentSurface(EGL_READ);
+    state.context = eglGetCurrentContext();
+    return state;
+}
+
+void makeCurrent(const EglState &state) {
+    if (!eglMakeCurrent(state.display, state.draw, state.read, state.context))
+        error("eglMakeCurrent failed: 0x%x", eglGetError());
+}
+
+// Runs ALVR OpenGL calls in the ALVR context, then switches back to the app context.
+// `finish` waits for the GPU so the app context can sample what ALVR rendered.
+template <typename F> void alvrGl(F &&calls, bool finish = false) {
+    makeCurrent(CTX.alvrEgl);
+    calls();
+    if (finish)
+        glFinish();
+    makeCurrent(CTX.appEgl);
+}
+
+GLuint importTexture(EGLImageKHR image) {
+    GLuint texture = 0;
+    GL(glGenTextures(1, &texture));
+    GL(glBindTexture(GL_TEXTURE_2D, texture));
+    CTX.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES) image);
+    GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+    GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+    GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+    GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+    return texture;
+}
+
+// Must be called with the app context current
+SharedTexture createSharedTexture(uint32_t width, uint32_t height) {
+    SharedTexture tex;
+
+    AHardwareBuffer_Desc desc = {};
+    desc.width = width;
+    desc.height = height;
+    desc.layers = 1;
+    desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
+    if (AHardwareBuffer_allocate(&desc, &tex.buffer) != 0) {
+        error("AHardwareBuffer_allocate(%d x %d) failed", width, height);
+        return {};
+    }
+
+    EGLClientBuffer clientBuffer = CTX.eglGetNativeClientBufferANDROID(tex.buffer);
+    const EGLint attribs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+
+    tex.appImage = CTX.eglCreateImageKHR(
+        CTX.appEgl.display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuffer, attribs);
+    tex.appTexture = importTexture(tex.appImage);
+
+    alvrGl([&] {
+        tex.alvrImage = CTX.eglCreateImageKHR(
+            CTX.alvrEgl.display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuffer, attribs);
+        tex.alvrTexture = importTexture(tex.alvrImage);
+    });
+
+    if (tex.appImage == EGL_NO_IMAGE_KHR || tex.alvrImage == EGL_NO_IMAGE_KHR)
+        error("eglCreateImageKHR failed: 0x%x", eglGetError());
+
+    return tex;
+}
+
+// Must be called with the app context current. With `contextsLost` the GL objects are already
+// gone together with their contexts and only the buffer is released.
+void destroySharedTexture(SharedTexture &tex, bool contextsLost = false) {
+    if (!contextsLost) {
+        if (tex.appTexture)
+            GL(glDeleteTextures(1, &tex.appTexture));
+        if (tex.appImage != EGL_NO_IMAGE_KHR)
+            CTX.eglDestroyImageKHR(CTX.appEgl.display, tex.appImage);
+        alvrGl([&] {
+            if (tex.alvrTexture)
+                GL(glDeleteTextures(1, &tex.alvrTexture));
+            if (tex.alvrImage != EGL_NO_IMAGE_KHR)
+                CTX.eglDestroyImageKHR(CTX.alvrEgl.display, tex.alvrImage);
+        });
+    }
+    if (tex.buffer)
+        AHardwareBuffer_release(tex.buffer);
+    tex = {};
 }
 
 // Inverse unit quaternion
@@ -360,7 +479,27 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_pauseN
 
 extern "C" JNIEXPORT void JNICALL
 Java_viritualisres_phonevr_ALVRActivity_surfaceCreatedNative(JNIEnv *, jobject) {
+    // Textures of the previous contexts are gone with them, only the buffers are left
+    for (auto &tex : CTX.lobbyTextures)
+        destroySharedTexture(tex, true);
+    for (auto &tex : CTX.streamTextures)
+        destroySharedTexture(tex, true);
+
+    CTX.eglGetNativeClientBufferANDROID =
+        (PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC) eglGetProcAddress(
+            "eglGetNativeClientBufferANDROID");
+    CTX.eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC) eglGetProcAddress("eglCreateImageKHR");
+    CTX.eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC) eglGetProcAddress("eglDestroyImageKHR");
+    CTX.glEGLImageTargetTexture2DOES =
+        (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC) eglGetProcAddress("glEGLImageTargetTexture2DOES");
+
+    // alvr_initialize_opengl() creates its own EGL context and leaves it current
+    CTX.appEgl = currentEgl();
     alvr_initialize_opengl();
+    CTX.alvrEgl = currentEgl();
+    makeCurrent(CTX.appEgl);
+
+    info("App EGL context %p, ALVR EGL context %p", CTX.appEgl.context, CTX.alvrEgl.context);
 
     CTX.glContextRecreated = true;
 }
@@ -433,9 +572,10 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
         // Note: if GL context is recreated, old resources are already freed.
         if (CTX.renderingParamsChanged && !CTX.glContextRecreated) {
             info("Pausing ALVR since glContext is not recreated, deleting textures");
-            alvr_pause_opengl();
+            alvrGl([] { alvr_pause_opengl(); });
 
-            GL(glDeleteTextures(2, CTX.lobbyTextures));
+            for (auto &tex : CTX.lobbyTextures)
+                destroySharedTexture(tex);
         }
 
         if (CTX.renderingParamsChanged || CTX.glContextRecreated) {
@@ -443,28 +583,13 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                  "renderingParamsChanged %b",
                  CTX.renderingParamsChanged,
                  CTX.glContextRecreated);
-            GL(glGenTextures(2, CTX.lobbyTextures));
+            for (auto &tex : CTX.lobbyTextures)
+                tex = createSharedTexture(CTX.screenWidth / 2, CTX.screenHeight);
 
-            for (auto &lobbyTexture : CTX.lobbyTextures) {
-                GL(glBindTexture(GL_TEXTURE_2D, lobbyTexture));
-                GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
-                GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
-                GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
-                GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
-                GL(glTexImage2D(GL_TEXTURE_2D,
-                                0,
-                                GL_RGB,
-                                CTX.screenWidth / 2,
-                                CTX.screenHeight,
-                                0,
-                                GL_RGB,
-                                GL_UNSIGNED_BYTE,
-                                nullptr));
-            }
-
-            const uint32_t *targetViews[2] = {(uint32_t *) &CTX.lobbyTextures[0],
-                                              (uint32_t *) &CTX.lobbyTextures[1]};
-            alvr_resume_opengl(CTX.screenWidth / 2, CTX.screenHeight, targetViews, 1);
+            const uint32_t *targetViews[2] = {&CTX.lobbyTextures[0].alvrTexture,
+                                              &CTX.lobbyTextures[1].alvrTexture};
+            alvrGl(
+                [&] { alvr_resume_opengl(CTX.screenWidth / 2, CTX.screenHeight, targetViews, 1); });
 
             CTX.renderingParamsChanged = false;
             CTX.glContextRecreated = false;
@@ -480,7 +605,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 info("ALVR Poll Event: HUD Message Update - %s", &message_buffer[0]);
 
                 if (message_length > 0)
-                    alvr_update_hud_message_opengl(&message_buffer[0]);
+                    alvrGl([&] { alvr_update_hud_message_opengl(&message_buffer[0]); });
             }
             if (event.tag == ALVR_EVENT_STREAMING_STARTED) {
                 info("ALVR Poll Event: ALVR_EVENT_STREAMING_STARTED, generating and binding "
@@ -496,33 +621,16 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                     info("Got settings from ALVR Server - %s", &settings_buffer[900]);
                 json settings_json = json::parse(&settings_buffer[0]);
 
-                GL(glGenTextures(2, CTX.streamTextures));
-
-                for (auto &streamTexture : CTX.streamTextures) {
-                    GL(glBindTexture(GL_TEXTURE_2D, streamTexture));
-                    GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
-                    GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
-                    GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
-                    GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
-                    GL(glTexImage2D(GL_TEXTURE_2D,
-                                    0,
-                                    GL_RGB,
-                                    config.view_width,
-                                    config.view_height,
-                                    0,
-                                    GL_RGB,
-                                    GL_UNSIGNED_BYTE,
-                                    nullptr));
-                }
+                for (auto &tex : CTX.streamTextures)
+                    tex = createSharedTexture(config.view_width, config.view_height);
 
                 CTX.fovArr[0] = getFov((CardboardEye) 0);
                 CTX.fovArr[1] = getFov((CardboardEye) 1);
 
                 info("ALVR Poll Event: ALVR_EVENT_STREAMING_STARTED, View configs updated...");
 
-                auto leftIntHandle = (uint32_t) CTX.streamTextures[0];
-                auto rightIntHandle = (uint32_t) CTX.streamTextures[1];
-                const uint32_t *textureHandles[2] = {&leftIntHandle, &rightIntHandle};
+                const uint32_t *textureHandles[2] = {&CTX.streamTextures[0].alvrTexture,
+                                                     &CTX.streamTextures[1].alvrTexture};
 
                 auto render_config = AlvrStreamConfig{};
                 render_config.view_resolution_width = config.view_width;
@@ -569,7 +677,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 info("render_config.foveation_edge_ratio_y: %f",
                      render_config.foveation_edge_ratio_y);
 
-                alvr_start_stream_opengl(render_config);
+                alvrGl([&] { alvr_start_stream_opengl(render_config); });
 
                 sendViewParams();
 
@@ -592,7 +700,8 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 alvr_destroy_decoder();
                 CTX.hasStreamFrame = false;
 
-                GL(glDeleteTextures(2, CTX.streamTextures));
+                for (auto &tex : CTX.streamTextures)
+                    destroySharedTexture(tex);
                 info("ALVR Poll Event: ALVR_EVENT_STREAMING_STOPPED, Stream stopped deleted "
                      "textures.");
             }
@@ -628,7 +737,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                     streamViews[eye].reprojection_rotation = reprojection;
                     streamViews[eye].fov = frameViews[eye].fov;
                 }
-                alvr_render_stream_opengl(streamHardwareBuffer, streamViews);
+                alvrGl([&] { alvr_render_stream_opengl(streamHardwareBuffer, streamViews); }, true);
 
                 alvr_report_submit(timestampNs, 0);
                 CTX.hasStreamFrame = true;
@@ -639,8 +748,8 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 return;
             }
 
-            viewsDescs[0].texture = CTX.streamTextures[0];
-            viewsDescs[1].texture = CTX.streamTextures[1];
+            viewsDescs[0].texture = CTX.streamTextures[0].appTexture;
+            viewsDescs[1].texture = CTX.streamTextures[1].appTexture;
         } else {
             AlvrPose pose = getPose(GetBootTimeNano() + VSYNC_QUEUE_INTERVAL_NS);
 
@@ -654,10 +763,10 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 viewInputs[eye].fov = getFov((CardboardEye) eye);
                 viewInputs[eye].swapchain_index = 0;
             }
-            alvr_render_lobby_opengl(viewInputs, true);
+            alvrGl([&] { alvr_render_lobby_opengl(viewInputs, true); }, true);
 
-            viewsDescs[0].texture = CTX.lobbyTextures[0];
-            viewsDescs[1].texture = CTX.lobbyTextures[1];
+            viewsDescs[0].texture = CTX.lobbyTextures[0].appTexture;
+            viewsDescs[1].texture = CTX.lobbyTextures[1].appTexture;
         }
 
         // Note: the Cardboard SDK does not support reprojection!

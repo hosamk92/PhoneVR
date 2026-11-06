@@ -34,7 +34,7 @@ target_include_directories(native-lib-alvr
 )
 
 target_link_libraries(native-lib-alvr
-    log android EGL GLESv3 mediandk
+    log android EGL GLESv3 mediandk nativewindow
     ${alvr_build_dir}/${ANDROID_ABI}/libalvr_client_core.so
     ${libs_dir}/jni/${ANDROID_ABI}/libGfxPluginCardboard.so
 )
