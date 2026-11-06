@@ -21,6 +21,11 @@ rustup target add \
 pushd ALVR
 # ALVR >= 20.9 needs its own openvr submodule (headers used by alvr_session's build script)
 git submodule update --init --recursive || exit 1
+# Backport of ALVR a915efcf (#3104): strict GLES drivers (most phones) reject the staging shader
+# without a default float precision and the client panics when the stream starts
+STAGING_FRAG="alvr/graphics/resources/staging_fragment.glsl"
+grep -q "precision mediump float" "$STAGING_FRAG" ||
+    sed -i '2s/$/\n\nprecision mediump float;/' "$STAGING_FRAG" || exit 1
 # Keep ALVR's own Cargo.lock (cargo update pulls untested crate versions)
 cargo xtask prepare-deps --platform android $@
 # ALVR 20.14 passes "-p <api level>" to cargo-ndk, which cargo-ndk 4.x reads as "--package"
