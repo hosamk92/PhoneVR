@@ -535,10 +535,10 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 // The streamer tells whether foveated encoding is actually used for this stream,
                 // the shape parameters come from the settings ("Enabled": {...} or "Disabled")
                 render_config.enable_foveation = false;
-                const json &video = settings_json.contains("video") ? settings_json["video"] : json();
+                const json &video =
+                    settings_json.contains("video") ? settings_json["video"] : json();
                 if (config.enable_foveated_encoding && video.is_object() &&
-                    video.contains("foveated_encoding") &&
-                    video["foveated_encoding"].is_object() &&
+                    video.contains("foveated_encoding") && video["foveated_encoding"].is_object() &&
                     video["foveated_encoding"].contains("Enabled")) {
                     const json &ffe = video["foveated_encoding"]["Enabled"];
                     info("settings_json.video.foveated_encoding is %s", ffe.dump().c_str());
