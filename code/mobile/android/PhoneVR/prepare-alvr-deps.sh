@@ -21,6 +21,8 @@ rustup target add \
 pushd ALVR
 # Keep ALVR's own Cargo.lock (cargo update pulls untested crate versions)
 cargo xtask prepare-deps --platform android $@
+# ALVR 20.14 passes "-p <api level>" to cargo-ndk, which cargo-ndk 4.x reads as "--package"
+cargo install cargo-ndk --version 3.5.7 --locked --force
 popd
 
 rm -r cardboard
